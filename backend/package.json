@@ -8,14 +8,20 @@
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
     "@supabase/supabase-js": "^2.49.4",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "geoip-lite": "^1.4.10",
     "helmet": "^8.1.0",
+    "ioredis": "^6.0.0",
     "pg": "^8.13.3",
     "qrcode": "^1.5.4",
     "ua-parser-js": "^2.0.10"
+  },
+  "devDependencies": {
+    "prisma": "^7.10.0"
   }
 }

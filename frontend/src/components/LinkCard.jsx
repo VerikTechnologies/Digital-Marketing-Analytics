@@ -66,6 +66,9 @@ export default function LinkCard({ qr, onUpdate, onEditDest, onHistory }) {
 
       <div className="flex md:flex-col gap-2 justify-start items-end md:ml-auto">
         <div className="flex gap-2">
+          <Button variant="outline" size="icon" title="Open Link" onClick={() => window.open(qr.public_url, "_blank")}>
+            <ExternalLink size={16} />
+          </Button>
           <Button variant="outline" size="icon" title="Copy URL" onClick={copyUrl}>
             <Copy size={16} />
           </Button>
