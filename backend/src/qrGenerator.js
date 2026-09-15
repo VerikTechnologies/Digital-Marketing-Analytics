@@ -178,9 +178,10 @@ export async function generateBeautifulQR(value, qrName, brandName, logoUrl, ret
     layers.push({ input: fallbackBuffer, top: Math.round(LOGO_Y + 20), left: Math.round(LOGO_X + 20) });
   }
 
-  const finalBuffer = await sharp(Buffer.from(bgSvg))
-    .png()
+  const finalBuffer = await sharp(Buffer.from(bgSvg), { density: 96 })
+    .resize(CANVAS_W, CANVAS_H)
     .composite(layers)
+    .png()
     .toBuffer();
 
   return finalBuffer;
