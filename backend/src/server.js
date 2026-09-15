@@ -256,10 +256,19 @@ app.put("/api/brands/:id", auth, async (req, res) => {
 });
 
 app.delete("/api/brands/:id", auth, async (req, res) => {
-  await prisma.brands.delete({ where: { id: BigInt(req.params.id) } });
-  await rDel("brands:all");
-  await audit(req.user, "delete", "brand", req.params.id);
-  res.status(204).end();
+  try {
+    await prisma.brands.delete({ where: { id: BigInt(req.params.id) } });
+    await rDel("brands:all");
+    await audit(req.user, "delete", "brand", req.params.id);
+    res.status(204).end();
+  } catch (error) {
+    if (error.code === 'P2003') {
+      res.status(400).json({ error: "Cannot delete brand because it has active QR codes or campaigns." });
+    } else {
+      console.error(error);
+      res.status(500).json({ error: "Failed to delete brand." });
+    }
+  }
 });
 
 // Campaigns ────────────────────────────────────────────────────────────────────
@@ -323,10 +332,19 @@ app.put("/api/campaigns/:id", auth, async (req, res) => {
 });
 
 app.delete("/api/campaigns/:id", auth, async (req, res) => {
-  await prisma.campaigns.delete({ where: { id: BigInt(req.params.id) } });
-  await rDel("campaigns:all");
-  await audit(req.user, "delete", "campaign", req.params.id);
-  res.status(204).end();
+  try {
+    await prisma.campaigns.delete({ where: { id: BigInt(req.params.id) } });
+    await rDel("campaigns:all");
+    await audit(req.user, "delete", "campaign", req.params.id);
+    res.status(204).end();
+  } catch (error) {
+    if (error.code === 'P2003') {
+      res.status(400).json({ error: "Cannot delete campaign because it has active QR codes." });
+    } else {
+      console.error(error);
+      res.status(500).json({ error: "Failed to delete campaign." });
+    }
+  }
 });
 
 // QRs ──────────────────────────────────────────────────────────────────────────
