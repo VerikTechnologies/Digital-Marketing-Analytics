@@ -2,11 +2,11 @@
   "rewrites": [
     {
       "source": "/api/:match*",
-      "destination": "https://YOUR-RENDER-BACKEND-URL.onrender.com/api/:match*"
+      "destination": "https://digital-marketing-analytics.onrender.com/api/:match*"
     },
     {
       "source": "/qr/:match*",
-      "destination": "https://YOUR-RENDER-BACKEND-URL.onrender.com/qr/:match*"
+      "destination": "https://digital-marketing-analytics.onrender.com/qr/:match*"
     },
     {
       "source": "/(.*)",
