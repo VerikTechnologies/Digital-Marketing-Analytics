@@ -5,12 +5,18 @@ import helmet from "helmet";
 import { createClient } from "@supabase/supabase-js";
 import { PrismaClient } from "./generated/prisma/index.js";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { generateBeautifulQR } from "./qrGenerator.js";
 import pg from "pg";
 import QRCode from "qrcode";
 import { UAParser } from "ua-parser-js";
 import geoip from "geoip-lite";
 import crypto from "crypto";
 import { rGet, rSet, rDel, rPushScan, rFlushScans } from "./redis.js";
+
+// Fix BigInt JSON serialization globally
+BigInt.prototype.toJSON = function () {
+  return Number(this);
+};
 
 let flushTimeout = null;
 function scheduleFlush() {
@@ -377,22 +383,28 @@ app.get("/api/qrs", auth, async (_req, res) => {
 });
 
 app.get("/api/qrs/:id", auth, async (req, res) => {
-  const id = BigInt(req.params.id);
-  const qr = await prisma.qrs.findFirst({
-    where: { id },
-    include: { brands: true, campaigns: true }
-  });
-  if (!qr) return res.status(404).json({ error: "QR not found" });
-  const dest = await prisma.destinations.findFirst({
-    where: { qr_id: id },
-    orderBy: { effective_from: "desc" }
-  });
-  res.json({
-    ...qr, id: Number(qr.id), brand_id: Number(qr.brand_id), campaign_id: Number(qr.campaign_id),
-    brand_name: qr.brands.name, campaign_name: qr.campaigns.name,
-    public_url: qrUrl(qr.code),
-    destination: dest ? { ...dest, id: Number(dest.id), qr_id: Number(dest.qr_id) } : null
-  });
+  try {
+    const id = BigInt(req.params.id);
+    const qr = await prisma.qrs.findFirst({
+      where: { id },
+      include: { brands: true, campaigns: true }
+    });
+    if (!qr) return res.status(404).json({ error: "QR not found" });
+    const dest = await prisma.destinations.findFirst({
+      where: { qr_id: id },
+      orderBy: { effective_from: "desc" }
+    });
+    const { brands, campaigns, ...safeQr } = qr;
+    res.json({
+      ...safeQr, id: Number(safeQr.id), brand_id: Number(safeQr.brand_id), campaign_id: Number(safeQr.campaign_id),
+      brand_name: brands?.name || "Unknown Brand", campaign_name: campaigns?.name || "Unknown Campaign",
+      public_url: qrUrl(safeQr.code),
+      destination: dest ? { ...dest, id: Number(dest.id), qr_id: Number(dest.qr_id) } : null
+    });
+  } catch (e) {
+    console.error("Error in GET /api/qrs/:id :", e);
+    res.status(500).json({ error: e.message, stack: e.stack });
+  }
 });
 
 app.post("/api/qrs", auth, async (req, res) => {
@@ -461,21 +473,41 @@ app.put("/api/qrs/:id", auth, async (req, res) => {
 });
 
 app.delete("/api/qrs/:id", auth, async (req, res) => {
-  const qr = await prisma.qrs.update({ where: { id: BigInt(req.params.id) }, data: { active: false } });
-  await rDel("qrs:all", `qr:${qr.code}`);
-  await audit(req.user, "disable", "qr", req.params.id);
-  res.status(204).end();
+  try {
+    const id = BigInt(req.params.id);
+    const qr = await prisma.qrs.findFirst({ where: { id }, select: { code: true } });
+    if (qr) {
+      await prisma.qrs.delete({ where: { id } });
+      await rDel("qrs:all", `qr:${qr.code}`);
+      await audit(req.user, "delete", "qr", req.params.id);
+    }
+    res.status(204).end();
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to delete QR code" });
+  }
 });
 
 // QR image generation ─────────────────────────────────────────────────────────
 async function qrImage(req, res, type) {
-  const qr = await prisma.qrs.findFirst({ where: { id: BigInt(req.params.id) }, select: { code: true } });
+  const qr = await prisma.qrs.findFirst({ 
+    where: { id: BigInt(req.params.id) }, 
+    include: { brands: { select: { name: true, logo_url: true } } }
+  });
   if (!qr) return res.status(404).send("Not found");
   const value = qrUrl(qr.code);
-  if (type === "svg") {
-    res.type("image/svg+xml").send(await QRCode.toString(value, { type: "svg", errorCorrectionLevel: "H", margin: 2, color: { dark: "#0B1320", light: "#FFFFFF" } }));
-  } else {
-    res.type("image/png").send(await QRCode.toBuffer(value, { errorCorrectionLevel: "H", margin: 2, width: 1400, color: { dark: "#0B1320", light: "#FFFFFF" } }));
+  
+  try {
+    if (type === "svg") {
+      const svgString = await generateBeautifulQR(value, qr.name, qr.brands?.name, qr.brands?.logo_url, true);
+      res.type("image/svg+xml").send(svgString);
+    } else {
+      const pngBuffer = await generateBeautifulQR(value, qr.name, qr.brands?.name, qr.brands?.logo_url, false);
+      res.type("image/png").send(pngBuffer);
+    }
+  } catch (error) {
+    console.error("QR Generation Error:", error);
+    res.status(500).send("Error generating image");
   }
 }
 app.get("/api/qrs/:id/png", auth, (req, res) => qrImage(req, res, "png"));

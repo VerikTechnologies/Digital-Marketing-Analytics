@@ -1,5 +1,5 @@
 import React from "react";
-import { Copy, Download, Power, Pencil, History, ExternalLink } from "lucide-react";
+import { Copy, Download, Power, Pencil, History, ExternalLink, Trash2 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Card } from "./ui/card";
 import api from "../api";
@@ -15,6 +15,12 @@ export default function LinkCard({ qr, onUpdate, onEditDest, onHistory }) {
   };
   const toggle = async () => {
     await api.put(`/api/qrs/${qr.id}`, { active: !qr.active });
+    onUpdate();
+  };
+
+  const handleDelete = async () => {
+    if (!window.confirm("Are you sure you want to permanently delete this QR code? All scans will be lost.")) return;
+    await api.delete(`/api/qrs/${qr.id}`);
     onUpdate();
   };
 
@@ -90,6 +96,9 @@ export default function LinkCard({ qr, onUpdate, onEditDest, onHistory }) {
             onClick={toggle}
           >
             <Power size={16} />
+          </Button>
+          <Button variant="outline" className="text-red-500 hover:text-red-700 hover:bg-red-50" size="icon" title="Delete QR Code" onClick={handleDelete}>
+            <Trash2 size={16} />
           </Button>
         </div>
       </div>

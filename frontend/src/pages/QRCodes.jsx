@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import {
-  Plus, Power, Download, Copy, ExternalLink, Pencil, History, Eye, RefreshCw
+  Plus, Power, Download, Copy, ExternalLink, Pencil, History, Eye, RefreshCw, Trash2
 } from "lucide-react";
 import Modal from "../components/Modal";
 import StatusPill from "../components/StatusPill";
@@ -192,6 +192,17 @@ export default function QRCodes() {
 
   function set(k) { return (e) => setForm((f) => ({ ...f, [k]: e.target.value })); }
 
+  async function handleDelete(id) {
+    if (!window.confirm("Are you sure you want to permanently delete this QR code? All scans will be lost.")) return;
+    try {
+      await api.delete(`/api/qrs/${id}`);
+      load();
+    } catch (e) {
+      console.error(e);
+      alert("Failed to delete QR code");
+    }
+  }
+
   async function handleCreate(e) {
     e.preventDefault(); setError(""); setSaving(true);
     try {
@@ -297,6 +308,9 @@ export default function QRCodes() {
                     </button>
                     <button className="btn-icon" title="Destination history" onClick={() => setHistQr(qr)}>
                       <History size={14} />
+                    </button>
+                    <button className="btn-icon btn-icon--danger" title="Delete QR Code" onClick={() => handleDelete(qr.id)}>
+                      <Trash2 size={14} />
                     </button>
                     <button className="btn-icon" title={copied === qr.id ? "Copied!" : "Copy URL"} onClick={() => copyUrl(qr)}>
                       <Copy size={14} />
