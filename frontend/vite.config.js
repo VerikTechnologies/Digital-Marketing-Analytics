@@ -13,8 +13,6 @@ export default defineConfig({
     proxy: {
       "/api": { target: "https://digital-marketing-analytics.onrender.com", changeOrigin: true },
       "/qr": { target: "https://digital-marketing-analytics.onrender.com", changeOrigin: true },
-      // "/api": { target: "http://localhost:4000", changeOrigin: true },
-      // "/qr": { target: "http://localhost:4000", changeOrigin: true },
     },
   },  
   build: {
