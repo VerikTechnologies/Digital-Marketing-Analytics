@@ -1,63 +1,70 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import { PrismaClient } from "./generated/prisma/index.js";
+import { PrismaPg } from "@prisma/adapter-pg";
 import pg from "pg";
 import QRCode from "qrcode";
 import { UAParser } from "ua-parser-js";
 import geoip from "geoip-lite";
 import crypto from "crypto";
+import { rGet, rSet, rDel, rPushScan, rFlushScans } from "./redis.js";
 
-dotenv.config();
+let flushTimeout = null;
+function scheduleFlush() {
+  if (!flushTimeout) {
+    flushTimeout = setTimeout(async () => {
+      flushTimeout = null;
+      await flushScanBuffer();
+    }, Number(process.env.SCAN_BUFFER_FLUSH_MS || 30000));
+  }
+}
 
 const app = express();
 app.set("trust proxy", true);
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",").map(x=>x.trim()) : true }));
-app.use(express.json({ limit: "2mb" })); 
+app.use(express.json({ limit: "2mb" }));
+
+// ── Prisma with PrismaPg driver adapter ──────────────────────────────────────
+const { Pool } = pg;
+const pgPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 20,
+});
+const adapter = new PrismaPg(pgPool);
+const prisma = new PrismaClient({
+  adapter,
+  log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
+});
 
 // ── Supabase clients ──────────────────────────────────────────────────────────
-// Admin client (service role key) — used for auth admin operations (createUser, listUsers, getUser)
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
-
-// Anon client — used for signInWithPassword (user-facing auth)
 const supabaseAnon = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY,
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-// ── PostgreSQL pool (direct connection to Supabase Postgres) ─────────────────
-const { Pool } = pg;
-const pool = new Pool({ 
-  connectionString: process.env.DATABASE_URL, 
-  ssl: { rejectUnauthorized: false },
-  max: 30 
-});
-
 const PORT = Number(process.env.PORT || 4000);
+// How often to flush the Redis scan buffer into PostgreSQL (default: 5s)
+const FLUSH_MS = Number(process.env.SCAN_BUFFER_FLUSH_MS || 5000);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const slugify = s => String(s || "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 120);
 const makeCode = () => `VK-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
 const qrUrl = code => `${(process.env.PUBLIC_QR_BASE_URL || "http://localhost:4000/qr").replace(/\/$/, "")}/${code}`;
+const bigInt = v => v !== undefined && v !== null ? BigInt(v) : v;
+const safeNum = v => v !== undefined && v !== null ? Number(v) : v;
 
-const cache = new Map();
-function getCache(key) {
-  const hit = cache.get(key);
-  if (hit && Date.now() < hit.expiry) return hit.data;
-  return null;
-}
-function setCache(key, data, ttl = 30000) {
-  cache.set(key, { data, expiry: Date.now() + ttl });
-}
-
-// Auth middleware — verifies Supabase JWT via getUser
+// ── Auth middleware ───────────────────────────────────────────────────────────
 const auth = async (req, res, next) => {
   const t = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || req.query.token;
   if (!t) return res.status(401).json({ error: "Authentication required" });
@@ -67,6 +74,7 @@ const auth = async (req, res, next) => {
   next();
 };
 
+// ── Visitor helpers ───────────────────────────────────────────────────────────
 const clientIp = req => String(req.headers["x-forwarded-for"] || req.ip || req.socket.remoteAddress || "").split(",")[0].trim();
 const ipHash = req => crypto.createHash("sha256").update(`${clientIp(req)}|${process.env.SUPABASE_SERVICE_ROLE_KEY}`).digest("hex");
 
@@ -88,15 +96,15 @@ function visitor(req) {
     user_agent: ua
   };
 }
+
 function smart(q, d, req) {
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   if (d.android_url && /android/.test(ua)) return ["android", d.android_url];
-  // Match iOS devices only — exclude macOS desktop (which also contains "mac os x" in Safari UA)
-  // A real iPhone/iPad/iPod UA always contains "mobile" or the device name; desktops do not.
   const isIos = /(iphone|ipad|ipod)/.test(ua) || (/(mac os x)/.test(ua) && /mobile/.test(ua));
   if (d.ios_url && isIos) return ["ios", d.ios_url];
   return ["website", d.website_url];
 }
+
 function addUtm(url, d) {
   try {
     const u = new URL(url);
@@ -105,11 +113,37 @@ function addUtm(url, d) {
     return u.toString();
   } catch { return url }
 }
+
 async function audit(user, action, type, id, details = {}) {
-  await pool.query(
-    "INSERT INTO audit_logs(admin_user_id, action, entity_type, entity_id, details) VALUES($1,$2,$3,$4,$5)",
-    [user?.id || null, action, type, id, JSON.stringify(details)]
-  );
+  await prisma.audit_logs.create({
+    data: {
+      admin_user_id: user?.id || null,
+      action,
+      entity_type: type,
+      entity_id: id ? BigInt(id) : null,
+      details,
+    }
+  });
+}
+
+// ── Redis scan buffer flush ───────────────────────────────────────────────────
+// Scans are pushed to Redis instantly (non-blocking), then flushed to Postgres
+// every FLUSH_MS. If Redis is unavailable, scans go directly to Postgres.
+async function flushScanBuffer() {
+  const scans = await rFlushScans(200);
+  if (!scans.length) return;
+  try {
+    await prisma.scans.createMany({
+      data: scans.map(s => ({
+        ...s,
+        qr_id: BigInt(s.qr_id),
+        destination_id: s.destination_id ? BigInt(s.destination_id) : null,
+      })),
+      skipDuplicates: true,
+    });
+  } catch (e) {
+    console.error("[scan-buffer] Flush error:", e.message);
+  }
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -125,42 +159,37 @@ async function ensureAdmin() {
   }
 }
 async function ensureSample() {
-  const { rows: [brand] } = await pool.query("SELECT id FROM brands WHERE slug='joeyrooms' LIMIT 1");
+  const brand = await prisma.brands.findFirst({ where: { slug: "joeyrooms" } });
   if (!brand) return;
-  const { rows: [camp] } = await pool.query("SELECT id FROM campaigns WHERE slug='ganesh-festival-2026' LIMIT 1");
-  let cid = camp?.id;
-  if (!cid) {
-    const { rows: [r] } = await pool.query(
-      "INSERT INTO campaigns(brand_id,name,slug,campaign_type,status) VALUES($1,$2,$3,$4,$5) RETURNING id",
-      [brand.id, "Ganesh Festival 2026", "ganesh-festival-2026", "Offline", "active"]
-    );
-    cid = r.id;
+  let camp = await prisma.campaigns.findFirst({ where: { slug: "ganesh-festival-2026" } });
+  if (!camp) {
+    camp = await prisma.campaigns.create({
+      data: { brand_id: brand.id, name: "Ganesh Festival 2026", slug: "ganesh-festival-2026", campaign_type: "Offline", status: "active" }
+    });
   }
-  const { rows: existing } = await pool.query("SELECT id FROM qrs WHERE code='VK-JR-GANESH-01' LIMIT 1");
-  if (!existing.length) {
-    const { rows: [r] } = await pool.query(
-      "INSERT INTO qrs(brand_id,campaign_id,name,code,channel,location) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
-      [brand.id, cid, "Joeyrooms Ganesh Gachibowli", "VK-JR-GANESH-01", "Flyer", "Gachibowli"]
-    );
-    await pool.query(
-      "INSERT INTO destinations(qr_id,website_url,utm_source,utm_medium,utm_campaign,utm_content) VALUES($1,$2,$3,$4,$5,$6)",
-      [r.id, "https://joeyrooms.com/", "offline", "flyer", "ganesh_festival_2026", "gachibowli_01"]
-    );
+  const existing = await prisma.qrs.findFirst({ where: { code: "VK-JR-GANESH-01" } });
+  if (!existing) {
+    const qr = await prisma.qrs.create({
+      data: { brand_id: brand.id, campaign_id: camp.id, name: "Joeyrooms Ganesh Gachibowli", code: "VK-JR-GANESH-01", channel: "Flyer", location: "Gachibowli" }
+    });
+    await prisma.destinations.create({
+      data: { qr_id: qr.id, website_url: "https://joeyrooms.com/", utm_source: "offline", utm_medium: "flyer", utm_campaign: "ganesh_festival_2026", utm_content: "gachibowli_01" }
+    });
   }
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.get("/health", async (_req, res) => {
-  try { await pool.query("SELECT 1"); res.json({ ok: true, service: "verik-universal-qr" }) }
-  catch { res.status(503).json({ ok: false }) }
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ ok: true, service: "verik-universal-qr" });
+  } catch { res.status(503).json({ ok: false }) }
 });
 
 // Auth ─────────────────────────────────────────────────────────────────────────
-// Login accepts { email, password } or { username, password } (username treated as email)
 app.post("/api/auth/login", async (req, res) => {
   const raw = req.body?.username || req.body?.email || "";
-  // If username looks like a bare word (no @), substitute the configured admin email
   const email = raw.includes("@") ? raw : (process.env.ADMIN_EMAIL || "admin@verik.com");
   const password = req.body?.password || "";
   const { data, error } = await supabaseAnon.auth.signInWithPassword({ email, password });
@@ -171,172 +200,260 @@ app.get("/api/auth/me", auth, (req, res) => res.json({ user: { id: req.user.id, 
 
 // Brands ───────────────────────────────────────────────────────────────────────
 app.get("/api/brands", auth, async (_req, res) => {
-  const { rows } = await pool.query(`
-    SELECT b.*, COUNT(DISTINCT c.id) campaigns, COUNT(DISTINCT q.id) qrs
+  // Trigger immediate flush so dashboard is up-to-date
+  await flushScanBuffer();
+
+  const cacheKey = "brands:all";
+  const cached = await rGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  const rows = await prisma.$queryRaw`
+    SELECT b.*, COUNT(DISTINCT c.id)::int campaigns, COUNT(DISTINCT q.id)::int qrs
     FROM brands b
     LEFT JOIN campaigns c ON c.brand_id = b.id
     LEFT JOIN qrs q ON q.brand_id = b.id
     GROUP BY b.id ORDER BY b.created_at DESC
-  `);
-  res.json(rows);
+  `;
+  // Serialize BigInt for JSON
+  const result = rows.map(r => ({ ...r, id: Number(r.id), qrs: Number(r.qrs), campaigns: Number(r.campaigns) }));
+  await rSet(cacheKey, result, 60);
+  res.json(result);
 });
+
 app.post("/api/brands", auth, async (req, res) => {
   const name = req.body?.name;
   if (!name) return res.status(400).json({ error: "name required" });
-  const { rows: [r] } = await pool.query(
-    "INSERT INTO brands(name,slug,website_url,logo_url,fb_pixel_id,ga_id) VALUES($1,$2,$3,$4,$5,$6) RETURNING id",
-    [name, slugify(req.body.slug || name), req.body.website_url || null, req.body.logo_url || null, req.body.fb_pixel_id || null, req.body.ga_id || null]
-  );
-  await audit(req.user, "create", "brand", r.id, { name });
-  res.status(201).json({ id: r.id });
+  const brand = await prisma.brands.create({
+    data: {
+      name,
+      slug: slugify(req.body.slug || name),
+      website_url: req.body.website_url || null,
+      logo_url: req.body.logo_url || null,
+      fb_pixel_id: req.body.fb_pixel_id || null,
+      ga_id: req.body.ga_id || null,
+    }
+  });
+  await rDel("brands:all");
+  await audit(req.user, "create", "brand", brand.id, { name });
+  res.status(201).json({ id: Number(brand.id) });
 });
+
 app.put("/api/brands/:id", auth, async (req, res) => {
-  await pool.query(
-    "UPDATE brands SET name=COALESCE($1,name), slug=COALESCE($2,slug), website_url=COALESCE($3,website_url), logo_url=COALESCE($4,logo_url), fb_pixel_id=COALESCE($5,fb_pixel_id), ga_id=COALESCE($6,ga_id), active=COALESCE($7,active) WHERE id=$8",
-    [req.body.name || null, req.body.slug ? slugify(req.body.slug) : null, req.body.website_url || null, req.body.logo_url || null, req.body.fb_pixel_id ?? null, req.body.ga_id ?? null, req.body.active ?? null, req.params.id]
-  );
-  await audit(req.user, "update", "brand", req.params.id, req.body);
+  const id = BigInt(req.params.id);
+  const data = {};
+  if (req.body.name !== undefined) data.name = req.body.name;
+  if (req.body.slug !== undefined) data.slug = slugify(req.body.slug);
+  if (req.body.website_url !== undefined) data.website_url = req.body.website_url;
+  if (req.body.logo_url !== undefined) data.logo_url = req.body.logo_url;
+  if (req.body.fb_pixel_id !== undefined) data.fb_pixel_id = req.body.fb_pixel_id;
+  if (req.body.ga_id !== undefined) data.ga_id = req.body.ga_id;
+  if (req.body.active !== undefined) data.active = req.body.active;
+  await prisma.brands.update({ where: { id }, data });
+  // Invalidate brand cache and any QR redirect caches referencing this brand
+  await rDel("brands:all");
+  await audit(req.user, "update", "brand", id, req.body);
   res.json({ ok: true });
 });
+
 app.delete("/api/brands/:id", auth, async (req, res) => {
-  await pool.query("DELETE FROM brands WHERE id=$1", [req.params.id]);
+  await prisma.brands.delete({ where: { id: BigInt(req.params.id) } });
+  await rDel("brands:all");
   await audit(req.user, "delete", "brand", req.params.id);
   res.status(204).end();
 });
 
 // Campaigns ────────────────────────────────────────────────────────────────────
 app.get("/api/campaigns", auth, async (_req, res) => {
-  const { rows } = await pool.query(`
-    SELECT c.*, b.name brand_name, COUNT(DISTINCT q.id) qrs, COUNT(s.id) scans
+  // Trigger immediate flush so dashboard is up-to-date
+  await flushScanBuffer();
+
+  const cacheKey = "campaigns:all";
+  const cached = await rGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  const rows = await prisma.$queryRaw`
+    SELECT c.*, b.name brand_name, COUNT(DISTINCT q.id)::int qrs, COUNT(s.id)::int scans
     FROM campaigns c
     JOIN brands b ON b.id = c.brand_id
     LEFT JOIN qrs q ON q.campaign_id = c.id
     LEFT JOIN scans s ON s.qr_id = q.id
     GROUP BY c.id, b.name ORDER BY c.created_at DESC
-  `);
-  res.json(rows);
+  `;
+  const result = rows.map(r => ({ ...r, id: Number(r.id), brand_id: Number(r.brand_id), qrs: Number(r.qrs), scans: Number(r.scans) }));
+  await rSet(cacheKey, result, 60);
+  res.json(result);
 });
+
 app.post("/api/campaigns", auth, async (req, res) => {
   if (!req.body?.brand_id || !req.body?.name) return res.status(400).json({ error: "brand_id and name required" });
-  const { rows: [r] } = await pool.query(
-    "INSERT INTO campaigns(brand_id,name,slug,campaign_type,start_date,end_date,budget,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
-    [req.body.brand_id, req.body.name, slugify(req.body.slug || req.body.name), req.body.campaign_type || "", req.body.start_date || null, req.body.end_date || null, req.body.budget || null, req.body.status || "active", req.body.notes || null]
-  );
-  await audit(req.user, "create", "campaign", r.id, req.body);
-  res.status(201).json({ id: r.id });
+  const camp = await prisma.campaigns.create({
+    data: {
+      brand_id: BigInt(req.body.brand_id),
+      name: req.body.name,
+      slug: slugify(req.body.slug || req.body.name),
+      campaign_type: req.body.campaign_type || "",
+      start_date: req.body.start_date ? new Date(req.body.start_date) : null,
+      end_date: req.body.end_date ? new Date(req.body.end_date) : null,
+      budget: req.body.budget || null,
+      status: req.body.status || "active",
+      notes: req.body.notes || null,
+    }
+  });
+  await rDel("campaigns:all");
+  await audit(req.user, "create", "campaign", camp.id, req.body);
+  res.status(201).json({ id: Number(camp.id) });
 });
+
 app.put("/api/campaigns/:id", auth, async (req, res) => {
-  const f = ["name", "slug", "campaign_type", "start_date", "end_date", "budget", "status", "notes"];
-  const keys = f.filter(k => req.body[k] !== undefined);
-  if (!keys.length) return res.status(400).json({ error: "No changes" });
-  const vals = keys.map(k => k === "slug" ? slugify(req.body[k]) : req.body[k]);
-  await pool.query(
-    `UPDATE campaigns SET ${keys.map((k, i) => `${k}=$${i + 1}`).join(",")} WHERE id=$${keys.length + 1}`,
-    [...vals, req.params.id]
-  );
-  await audit(req.user, "update", "campaign", req.params.id, req.body);
+  const id = BigInt(req.params.id);
+  const data = {};
+  const fields = ["name", "slug", "campaign_type", "start_date", "end_date", "budget", "status", "notes"];
+  for (const f of fields) {
+    if (req.body[f] !== undefined) {
+      if (f === "slug") data.slug = slugify(req.body[f]);
+      else if (f === "start_date" || f === "end_date") data[f] = req.body[f] ? new Date(req.body[f]) : null;
+      else data[f] = req.body[f];
+    }
+  }
+  if (!Object.keys(data).length) return res.status(400).json({ error: "No changes" });
+  await prisma.campaigns.update({ where: { id }, data });
+  await rDel("campaigns:all");
+  await audit(req.user, "update", "campaign", id, req.body);
   res.json({ ok: true });
 });
+
 app.delete("/api/campaigns/:id", auth, async (req, res) => {
-  await pool.query("DELETE FROM campaigns WHERE id=$1", [req.params.id]);
+  await prisma.campaigns.delete({ where: { id: BigInt(req.params.id) } });
+  await rDel("campaigns:all");
   await audit(req.user, "delete", "campaign", req.params.id);
   res.status(204).end();
 });
 
 // QRs ──────────────────────────────────────────────────────────────────────────
 app.get("/api/qrs", auth, async (_req, res) => {
-  // Use a single aggregating JOIN instead of correlated subqueries to avoid
-  // O(n) extra queries. CURRENT_DATE is cast in IST (UTC+5:30) so "today" aligns
-  // with the local business day rather than UTC midnight.
-  const { rows } = await pool.query(`
+  // Trigger immediate flush so dashboard is up-to-date
+  await flushScanBuffer();
+
+  const cacheKey = "qrs:all";
+  const cached = await rGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  const rows = await prisma.$queryRaw`
     SELECT q.*, b.name brand_name, c.name campaign_name,
-      COALESCE(agg.total_scans, 0)  AS scans,
-      COALESCE(agg.today_scans, 0)  AS today
+      COALESCE(agg.total_scans, 0)::int  AS scans,
+      COALESCE(agg.today_scans, 0)::int  AS today
     FROM qrs q
     JOIN brands b    ON b.id = q.brand_id
     JOIN campaigns c ON c.id = q.campaign_id
     LEFT JOIN (
-      SELECT
-        qr_id,
-        COUNT(*)                                                       AS total_scans,
-        COUNT(*) FILTER (WHERE scanned_at >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
-                                                                       AS today_scans
-      FROM scans
-      GROUP BY qr_id
+      SELECT qr_id,
+        COUNT(*)                                                          AS total_scans,
+        COUNT(*) FILTER (WHERE scanned_at >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date) AS today_scans
+      FROM scans GROUP BY qr_id
     ) agg ON agg.qr_id = q.id
     ORDER BY q.created_at DESC
-  `);
-  res.json(rows.map(x => ({ ...x, public_url: qrUrl(x.code) })));
+  `;
+  const result = rows.map(x => ({ ...x, id: Number(x.id), brand_id: Number(x.brand_id), campaign_id: Number(x.campaign_id), public_url: qrUrl(x.code) }));
+  await rSet(cacheKey, result, 30);
+  res.json(result);
 });
+
 app.get("/api/qrs/:id", auth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT q.*, b.name brand_name, c.name campaign_name
-    FROM qrs q
-    JOIN brands b ON b.id = q.brand_id
-    JOIN campaigns c ON c.id = q.campaign_id
-    WHERE q.id = $1
-  `, [req.params.id]);
-  if (!rows[0]) return res.status(404).json({ error: "QR not found" });
-  const { rows: dest } = await pool.query(
-    "SELECT * FROM destinations WHERE qr_id=$1 ORDER BY effective_from DESC LIMIT 1",
-    [req.params.id]
-  );
-  res.json({ ...rows[0], public_url: qrUrl(rows[0].code), destination: dest[0] || null });
+  const id = BigInt(req.params.id);
+  const qr = await prisma.qrs.findFirst({
+    where: { id },
+    include: { brands: true, campaigns: true }
+  });
+  if (!qr) return res.status(404).json({ error: "QR not found" });
+  const dest = await prisma.destinations.findFirst({
+    where: { qr_id: id },
+    orderBy: { effective_from: "desc" }
+  });
+  res.json({
+    ...qr, id: Number(qr.id), brand_id: Number(qr.brand_id), campaign_id: Number(qr.campaign_id),
+    brand_name: qr.brands.name, campaign_name: qr.campaigns.name,
+    public_url: qrUrl(qr.code),
+    destination: dest ? { ...dest, id: Number(dest.id), qr_id: Number(dest.qr_id) } : null
+  });
 });
+
 app.post("/api/qrs", auth, async (req, res) => {
   const { brand_id, campaign_id, name, code, channel, location, active = true, website_url, android_url, ios_url, utm_source, utm_medium, utm_campaign, utm_content, utm_term } = req.body || {};
   if (!brand_id || !campaign_id || !name || !website_url) return res.status(400).json({ error: "brand_id, campaign_id, name and website_url required" });
   const finalCode = (code || makeCode()).toUpperCase().replace(/[^A-Z0-9-]/g, "-");
   try {
-    const { rows: [r] } = await pool.query(
-      "INSERT INTO qrs(brand_id,campaign_id,name,code,channel,location,active) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
-      [brand_id, campaign_id, name, finalCode, channel || "", location || "", !!active]
-    );
-    await pool.query(
-      "INSERT INTO destinations(qr_id,website_url,android_url,ios_url,utm_source,utm_medium,utm_campaign,utm_content,utm_term) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-      [r.id, website_url, android_url || null, ios_url || null, utm_source || "", utm_medium || "", utm_campaign || "", utm_content || "", utm_term || ""]
-    );
-    await audit(req.user, "create", "qr", r.id, { code: finalCode });
-    res.status(201).json({ id: r.id, code: finalCode, public_url: qrUrl(finalCode) });
+    const qr = await prisma.qrs.create({
+      data: {
+        brand_id: BigInt(brand_id), campaign_id: BigInt(campaign_id), name, code: finalCode,
+        channel: channel || "", location: location || "", active: !!active
+      }
+    });
+    await prisma.destinations.create({
+      data: {
+        qr_id: qr.id, website_url,
+        android_url: android_url || null, ios_url: ios_url || null,
+        utm_source: utm_source || "", utm_medium: utm_medium || "",
+        utm_campaign: utm_campaign || "", utm_content: utm_content || "", utm_term: utm_term || ""
+      }
+    });
+    await rDel("qrs:all");
+    await audit(req.user, "create", "qr", qr.id, { code: finalCode });
+    res.status(201).json({ id: Number(qr.id), code: finalCode, public_url: qrUrl(finalCode) });
   } catch (e) {
     console.error("QR Create Error:", e);
-    res.status(e.code === "23505" ? 409 : 500).json({ error: e.code === "23505" ? "QR code already exists" : "Failed to create QR" });
+    res.status(e.code === "P2002" ? 409 : 500).json({ error: e.code === "P2002" ? "QR code already exists" : "Failed to create QR" });
   }
 });
+
 app.put("/api/qrs/:id", auth, async (req, res) => {
-  const id = Number(req.params.id);
-  const f = ["name", "channel", "location", "active"];
-  const keys = f.filter(k => req.body[k] !== undefined);
-  if (keys.length) await pool.query(
-    `UPDATE qrs SET ${keys.map((k, i) => `${k}=$${i + 1}`).join(",")} WHERE id=$${keys.length + 1}`,
-    [...keys.map(k => req.body[k]), id]
-  );
+  const id = BigInt(req.params.id);
+  const qrData = {};
+  for (const f of ["name", "channel", "location", "active"]) {
+    if (req.body[f] !== undefined) qrData[f] = req.body[f];
+  }
+  if (Object.keys(qrData).length) await prisma.qrs.update({ where: { id }, data: qrData });
+
   const destinationFields = ["website_url", "android_url", "ios_url", "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "fb_pixel_id", "ga_id"];
   const dk = destinationFields.filter(k => req.body[k] !== undefined);
   if (dk.length) {
-    await pool.query("UPDATE destinations SET effective_to=NOW() WHERE qr_id=$1 AND effective_to IS NULL", [id]);
-    const { rows: [current] } = await pool.query("SELECT * FROM destinations WHERE qr_id=$1 ORDER BY effective_from DESC LIMIT 1", [id]);
+    await prisma.destinations.updateMany({ where: { qr_id: id, effective_to: null }, data: { effective_to: new Date() } });
+    const current = await prisma.destinations.findFirst({ where: { qr_id: id }, orderBy: { effective_from: "desc" } });
     const base = current || {};
-    const vals = destinationFields.map(k => req.body[k] !== undefined ? req.body[k] : (base[k] ?? null));
-    await pool.query(
-      "INSERT INTO destinations(qr_id,website_url,android_url,ios_url,utm_source,utm_medium,utm_campaign,utm_content,utm_term,fb_pixel_id,ga_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-      [id, ...vals]
-    );
+    await prisma.destinations.create({
+      data: {
+        qr_id: id,
+        website_url: req.body.website_url ?? base.website_url ?? "",
+        android_url: req.body.android_url !== undefined ? req.body.android_url : (base.android_url ?? null),
+        ios_url: req.body.ios_url !== undefined ? req.body.ios_url : (base.ios_url ?? null),
+        utm_source: req.body.utm_source ?? base.utm_source ?? "",
+        utm_medium: req.body.utm_medium ?? base.utm_medium ?? "",
+        utm_campaign: req.body.utm_campaign ?? base.utm_campaign ?? "",
+        utm_content: req.body.utm_content ?? base.utm_content ?? "",
+        utm_term: req.body.utm_term ?? base.utm_term ?? "",
+        fb_pixel_id: req.body.fb_pixel_id !== undefined ? req.body.fb_pixel_id : (base.fb_pixel_id ?? null),
+        ga_id: req.body.ga_id !== undefined ? req.body.ga_id : (base.ga_id ?? null),
+      }
+    });
   }
+  // Invalidate both the QR list and the redirect cache for this QR's code
+  const qr = await prisma.qrs.findFirst({ where: { id }, select: { code: true } });
+  if (qr) await rDel("qrs:all", `qr:${qr.code}`);
   await audit(req.user, "update", "qr", id, req.body);
   res.json({ ok: true });
 });
+
 app.delete("/api/qrs/:id", auth, async (req, res) => {
-  await pool.query("UPDATE qrs SET active=FALSE WHERE id=$1", [req.params.id]);
+  const qr = await prisma.qrs.update({ where: { id: BigInt(req.params.id) }, data: { active: false } });
+  await rDel("qrs:all", `qr:${qr.code}`);
   await audit(req.user, "disable", "qr", req.params.id);
   res.status(204).end();
 });
 
-// QR image generation
+// QR image generation ─────────────────────────────────────────────────────────
 async function qrImage(req, res, type) {
-  const { rows } = await pool.query("SELECT code FROM qrs WHERE id=$1", [req.params.id]);
-  if (!rows[0]) return res.status(404).send("Not found");
-  const value = qrUrl(rows[0].code);
+  const qr = await prisma.qrs.findFirst({ where: { id: BigInt(req.params.id) }, select: { code: true } });
+  if (!qr) return res.status(404).send("Not found");
+  const value = qrUrl(qr.code);
   if (type === "svg") {
     res.type("image/svg+xml").send(await QRCode.toString(value, { type: "svg", errorCorrectionLevel: "H", margin: 2, color: { dark: "#0B1320", light: "#FFFFFF" } }));
   } else {
@@ -346,19 +463,23 @@ async function qrImage(req, res, type) {
 app.get("/api/qrs/:id/png", auth, (req, res) => qrImage(req, res, "png"));
 app.get("/api/qrs/:id/svg", auth, (req, res) => qrImage(req, res, "svg"));
 app.get("/api/qrs/:id/history", auth, async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM destinations WHERE qr_id=$1 ORDER BY effective_from DESC", [req.params.id]);
-  res.json(rows);
+  const rows = await prisma.destinations.findMany({
+    where: { qr_id: BigInt(req.params.id) },
+    orderBy: { effective_from: "desc" }
+  });
+  res.json(rows.map(r => ({ ...r, id: Number(r.id), qr_id: Number(r.qr_id) })));
 });
+
 app.get("/api/qrs/:id/scans.csv", auth, async (req, res) => {
-  const { rows } = await pool.query(`
+  const rows = await prisma.$queryRaw`
     SELECT s.scanned_at, b.name brand, c.name campaign, q.name qr_name, q.code, q.channel, q.location,
       s.country, s.city, s.browser, s.browser_version, s.os, s.os_version, s.device, s.device_type, s.referrer, s.destination_type
     FROM scans s
     JOIN qrs q ON q.id = s.qr_id
     JOIN brands b ON b.id = q.brand_id
     JOIN campaigns c ON c.id = q.campaign_id
-    WHERE q.id = $1 ORDER BY s.scanned_at DESC
-  `, [req.params.id]);
+    WHERE q.id = ${BigInt(req.params.id)} ORDER BY s.scanned_at DESC
+  `;
   const cols = ["scanned_at","brand","campaign","qr_name","code","channel","location","country","city","browser","browser_version","os","os_version","device","device_type","referrer","destination_type"];
   const esc = v => `"${String(v ?? "").replaceAll('"', '""')}"`;
   res.type("text/csv")
@@ -368,163 +489,198 @@ app.get("/api/qrs/:id/scans.csv", auth, async (req, res) => {
 
 // Analytics ────────────────────────────────────────────────────────────────────
 app.get("/api/analytics/summary", auth, async (req, res) => {
+  // Trigger immediate flush so dashboard is up-to-date
+  await flushScanBuffer();
+
   const days = Math.min(3650, Math.max(1, Number(req.query.range || 30)));
-  const cacheKey = `summary:${days}`;
-  const cached = getCache(cacheKey);
+  const cacheKey = `analytics:summary:${days}`;
+  const cached = await rGet(cacheKey);
   if (cached) return res.json(cached);
 
-  const [
-    { rows: [scans] },
-    { rows: [today] },
-    { rows: [qrs] },
-    { rows: [brands] },
-    { rows: [campaigns] },
-    { rows: top }
-  ] = await Promise.all([
-    pool.query("SELECT COUNT(*) c FROM scans WHERE scanned_at >= NOW() - $1 * INTERVAL '1 day'", [days]),
-    // Cast to IST date so "today" reflects the local business day, not UTC midnight
-    pool.query("SELECT COUNT(*) c FROM scans WHERE scanned_at >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date"),
-    // Count only active QR codes so the KPI label matches reality
-    pool.query("SELECT COUNT(*) c FROM qrs WHERE active=TRUE"),
-    pool.query("SELECT COUNT(*) c FROM brands WHERE active=TRUE"),
-    pool.query("SELECT COUNT(*) c FROM campaigns WHERE status='active'"),
-    pool.query(
-      "SELECT q.name, q.code, COUNT(*) scans FROM scans s JOIN qrs q ON q.id=s.qr_id WHERE s.scanned_at >= NOW() - $1 * INTERVAL '1 day' GROUP BY q.id, q.name, q.code ORDER BY scans DESC LIMIT 10",
-      [days]
-    )
+  const [scansRow, todayRow, qrsRow, brandsRow, campsRow, top] = await Promise.all([
+    prisma.$queryRaw`SELECT COUNT(*)::int c FROM scans WHERE scanned_at >= NOW() - ${days} * INTERVAL '1 day'`,
+    prisma.$queryRaw`SELECT COUNT(*)::int c FROM scans WHERE scanned_at >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date`,
+    prisma.$queryRaw`SELECT COUNT(*)::int c FROM qrs WHERE active=TRUE`,
+    prisma.$queryRaw`SELECT COUNT(*)::int c FROM brands WHERE active=TRUE`,
+    prisma.$queryRaw`SELECT COUNT(*)::int c FROM campaigns WHERE status='active'`,
+    prisma.$queryRaw`SELECT q.name, q.code, COUNT(*)::int scans FROM scans s JOIN qrs q ON q.id=s.qr_id WHERE s.scanned_at >= NOW() - ${days} * INTERVAL '1 day' GROUP BY q.id, q.name, q.code ORDER BY scans DESC LIMIT 10`,
   ]);
-  const result = { scans: Number(scans.c), today: Number(today.c), qrs: Number(qrs.c), brands: Number(brands.c), campaigns: Number(campaigns.c), top };
-  setCache(cacheKey, result);
+  const result = {
+    scans: scansRow[0].c, today: todayRow[0].c, qrs: qrsRow[0].c,
+    brands: brandsRow[0].c, campaigns: campsRow[0].c, top
+  };
+  await rSet(cacheKey, result, 30);
   res.json(result);
 });
+
 app.get("/api/analytics/timeseries", auth, async (req, res) => {
+  await flushScanBuffer();
+
   const days = Math.min(3650, Math.max(1, Number(req.query.range || 30)));
-  const cacheKey = `timeseries:${days}`;
-  const cached = getCache(cacheKey);
+  const cacheKey = `analytics:timeseries:${days}`;
+  const cached = await rGet(cacheKey);
   if (cached) return res.json(cached);
 
-  const { rows } = await pool.query(
-    "SELECT DATE(scanned_at) date, COUNT(*) scans FROM scans WHERE scanned_at >= CURRENT_DATE - $1 * INTERVAL '1 day' GROUP BY DATE(scanned_at) ORDER BY date",
-    [days]
-  );
-  setCache(cacheKey, rows);
+  const rows = await prisma.$queryRaw`
+    SELECT DATE(scanned_at) date, COUNT(*)::int scans FROM scans
+    WHERE scanned_at >= CURRENT_DATE - ${days} * INTERVAL '1 day'
+    GROUP BY DATE(scanned_at) ORDER BY date
+  `;
+  await rSet(cacheKey, rows, 30);
   res.json(rows);
 });
+
 app.get("/api/analytics/breakdown", auth, async (req, res) => {
+  await flushScanBuffer();
+
   const days = Math.min(3650, Math.max(1, Number(req.query.range || 30)));
-  const cacheKey = `breakdown:${days}`;
-  const cached = getCache(cacheKey);
+  const cacheKey = `analytics:breakdown:${days}`;
+  const cached = await rGet(cacheKey);
   if (cached) return res.json(cached);
 
-  async function group(field) {
-    const { rows } = await pool.query(
-      `SELECT COALESCE(${field},'Unknown') label, COUNT(*) value FROM scans WHERE scanned_at >= NOW() - $1 * INTERVAL '1 day' GROUP BY ${field} ORDER BY value DESC LIMIT 12`,
-      [days]
+  const group = async (field) => {
+    return prisma.$queryRawUnsafe(
+      `SELECT COALESCE(${field},'Unknown') label, COUNT(*)::int value FROM scans WHERE scanned_at >= NOW() - $1 * INTERVAL '1 day' GROUP BY ${field} ORDER BY value DESC LIMIT 12`,
+      days
     );
-    return rows;
-  }
-  
+  };
+
   const [browser, os, device, country, city, destination] = await Promise.all([
     group("browser"), group("os"), group("device_type"),
     group("country"), group("city"), group("destination_type")
   ]);
-  
   const result = { browser, os, device, country, city, destination };
-  setCache(cacheKey, result);
+  await rSet(cacheKey, result, 30);
   res.json(result);
 });
+
 app.get("/api/analytics/export", auth, async (req, res) => {
-  const { rows } = await pool.query(`
-    SELECT 
-      s.scanned_at,
-      q.code AS qr_code,
-      q.name AS qr_name,
-      b.name AS brand_name,
-      c.name AS campaign_name,
-      s.country,
-      s.city,
-      s.browser,
-      s.os,
-      s.device,
-      s.device_type,
-      s.referrer,
-      d.utm_source,
-      d.utm_medium,
-      d.utm_campaign,
-      d.utm_content,
-      d.utm_term
+  await flushScanBuffer();
+
+  const rows = await prisma.$queryRaw`
+    SELECT s.scanned_at, q.code AS qr_code, q.name AS qr_name, b.name AS brand_name,
+      c.name AS campaign_name, s.country, s.city, s.browser, s.os, s.device, s.device_type,
+      s.referrer, d.utm_source, d.utm_medium, d.utm_campaign, d.utm_content, d.utm_term
     FROM scans s
     JOIN qrs q ON s.qr_id = q.id
     JOIN brands b ON q.brand_id = b.id
     JOIN campaigns c ON q.campaign_id = c.id
     JOIN destinations d ON s.destination_id = d.id
     ORDER BY s.scanned_at DESC
-  `);
-  
-  const headers = ["Scanned At", "QR Code", "QR Name", "Brand", "Campaign", "Country", "City", "Browser", "OS", "Device", "Device Type", "Referrer", "UTM Source", "UTM Medium", "UTM Campaign", "UTM Content", "UTM Term"];
+  `;
+  const headers = ["Scanned At","QR Code","QR Name","Brand","Campaign","Country","City","Browser","OS","Device","Device Type","Referrer","UTM Source","UTM Medium","UTM Campaign","UTM Content","UTM Term"];
+  const esc = v => `"${String(v ?? "").replaceAll('"', '""')}"`;
   const csv = [
     headers.join(","),
     ...rows.map(r => [
-      r.scanned_at, r.qr_code, `"${(r.qr_name || "").replace(/"/g, '""')}"`, `"${(r.brand_name || "").replace(/"/g, '""')}"`, `"${(r.campaign_name || "").replace(/"/g, '""')}"`,
-      r.country || "", r.city || "", r.browser || "", r.os || "", r.device || "", r.device_type || "", `"${(r.referrer || "").replace(/"/g, '""')}"`,
-      r.utm_source || "", r.utm_medium || "", r.utm_campaign || "", r.utm_content || "", r.utm_term || ""
+      r.scanned_at, r.qr_code, esc(r.qr_name), esc(r.brand_name), esc(r.campaign_name),
+      r.country || "", r.city || "", r.browser || "", r.os || "", r.device || "", r.device_type || "",
+      esc(r.referrer), r.utm_source || "", r.utm_medium || "", r.utm_campaign || "", r.utm_content || "", r.utm_term || ""
     ].join(","))
   ].join("\n");
-  
   res.setHeader("Content-Type", "text/csv");
   res.setHeader("Content-Disposition", 'attachment; filename="analytics_export.csv"');
   res.send(csv);
 });
 
 // QR redirect ─────────────────────────────────────────────────────────────────
+// CRITICAL PATH — must be as fast as possible.
+// 1. Check Redis cache (0-1ms)  2. Query Postgres (10-30ms)  3. Buffer scan in Redis
 app.get("/qr/:code", async (req, res) => {
-  const { rows: [q] } = await pool.query("SELECT * FROM qrs WHERE code=$1 AND active=TRUE LIMIT 1", [req.params.code]);
-  if (!q) return res.status(404).send("QR code is unavailable.");
-  const { rows: [d] } = await pool.query("SELECT * FROM destinations WHERE qr_id=$1 AND effective_to IS NULL ORDER BY effective_from DESC LIMIT 1", [q.id]);
-  if (!d) return res.status(404).send("QR destination is unavailable.");
-  
-  const { rows: [b] } = await pool.query("SELECT fb_pixel_id, ga_id FROM brands WHERE id=$1 LIMIT 1", [q.brand_id]);
-  const fbPixel = d.fb_pixel_id || (b && b.fb_pixel_id);
-  const gaId = d.ga_id || (b && b.ga_id);
+  const code = req.params.code;
+  const cacheKey = `qr:${code}`;
 
-  const v = visitor(req), [type, target] = smart(q, d, req), destination = addUtm(target, d);
-  await pool.query(
-    "INSERT INTO scans(qr_id,destination_id,ip_hash,country,city,browser,browser_version,os,os_version,device,device_type,referrer,user_agent,destination_type) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-    [q.id, d.id, v.ip_hash, v.country, v.city, v.browser, v.browser_version, v.os, v.os_version, v.device, v.device_type, v.referrer, v.user_agent, type]
-  );
-  
+  // Step 1: Serve from Redis cache if available
+  let qrData = await rGet(cacheKey);
+  if (!qrData) {
+    // Step 2: Query DB — fetch QR, active destination, brand pixels in one go
+    const qr = await prisma.qrs.findFirst({
+      where: { code, active: true },
+      include: {
+        destinations: {
+          where: { effective_to: null },
+          orderBy: { effective_from: "desc" },
+          take: 1
+        },
+        brands: { select: { fb_pixel_id: true, ga_id: true } }
+      }
+    });
+    if (!qr || !qr.destinations.length) return res.status(404).send("QR code is unavailable.");
+    const d = qr.destinations[0];
+    qrData = {
+      qr_id: Number(qr.id),
+      dest_id: Number(d.id),
+      website_url: d.website_url,
+      android_url: d.android_url,
+      ios_url: d.ios_url,
+      utm_source: d.utm_source, utm_medium: d.utm_medium,
+      utm_campaign: d.utm_campaign, utm_content: d.utm_content, utm_term: d.utm_term,
+      fb_pixel_id: d.fb_pixel_id || qr.brands?.fb_pixel_id || null,
+      ga_id: d.ga_id || qr.brands?.ga_id || null,
+    };
+    // Cache for 5 minutes — invalidated immediately on PUT /api/qrs/:id
+    await rSet(cacheKey, qrData, 300);
+  }
+
+  // Step 3: Determine destination URL based on device
+  const [type, target] = smart({ active: true }, qrData, req);
+  const destination = addUtm(target, qrData);
+  const v = visitor(req);
+
+  // Step 4: Buffer scan — non-blocking (fire & forget)
+  const scanPayload = {
+    qr_id: qrData.qr_id, destination_id: qrData.dest_id,
+    ip_hash: v.ip_hash, country: v.country, city: v.city,
+    browser: v.browser, browser_version: v.browser_version,
+    os: v.os, os_version: v.os_version,
+    device: v.device, device_type: v.device_type,
+    referrer: v.referrer, user_agent: v.user_agent,
+    destination_type: type,
+  };
+  // If Redis is available, push to buffer; otherwise insert directly
+  const bufferedLen = await rPushScan(scanPayload);
+  if (bufferedLen) {
+    if (bufferedLen >= 100) {
+      // Threshold reached! Flush immediately to DB
+      flushScanBuffer();
+    } else if (process.env.AUTOMATIC_FLUSH !== "true") {
+      // Lazy flush (only if background automatic flush is turned off)
+      scheduleFlush();
+    }
+  } else {
+    // Redis unavailable — write directly (no data loss)
+    prisma.scans.create({
+      data: { ...scanPayload, qr_id: BigInt(scanPayload.qr_id), destination_id: BigInt(scanPayload.destination_id) }
+    }).catch(e => console.error("[scan-direct]", e.message));
+  }
+
+  // Step 5: Respond — tracking page or instant redirect
+  const { fb_pixel_id: fbPixel, ga_id: gaId } = qrData;
   if (fbPixel || gaId) {
     res.removeHeader("Content-Security-Policy");
     res.removeHeader("Cross-Origin-Opener-Policy");
     res.removeHeader("Cross-Origin-Resource-Policy");
-    let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Redirecting...</title>`;
+    let html = `<!DOCTYPE html><html><head><meta charset="utf-8">`;
     html += `<noscript><meta http-equiv="refresh" content="0; url=${destination}"></noscript>`;
+    
     if (gaId) {
-      html += `
-<script async src="https://www.googletagmanager.com/gtag/js?id=${gaId}"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-  gtag('config', '${gaId}');
-</script>`;
+      html += `\n<script async src="https://www.googletagmanager.com/gtag/js?id=${gaId}"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','${gaId}');</script>`;
     }
     if (fbPixel) {
-      html += `
-<script>
-!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window, document,'script','https://connect.facebook.net/en_US/fbevents.js');
-fbq('init', '${fbPixel}');
-fbq('track', 'PageView');
-</script>
+      html += `\n<script>!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');fbq('init','${fbPixel}');fbq('track','PageView');</script>
 <noscript><img height="1" width="1" style="display:none" src="https://www.facebook.com/tr?id=${fbPixel}&ev=PageView&noscript=1"/></noscript>`;
     }
-    html += `</head><body style="background:#fff;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;color:#333;">`;
-    html += `<div style="text-align:center;"><div style="width:24px;height:24px;border:3px solid #f3f3f3;border-top:3px solid #3B82F6;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px auto;"></div><style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style><div style="font-size:14px;font-weight:500;">Redirecting...</div></div>`;
-    html += `<script>setTimeout(function(){ window.location.replace('${destination}'); }, 100);</script>`;
+    // Visually completely blank page to avoid user suspicion
+    html += `</head><body style="background:#fff;margin:0;padding:0;">`;
+    // 50ms timeout gives the pixel network requests time to initiate before navigating away
+    html += `<script>setTimeout(function(){window.location.replace('${destination}');},50);</script>`;
     html += `</body></html>`;
+    
     return res.send(html);
   }
 
+  // If no pixels are configured, just do an instant 302 redirect
   res.redirect(302, destination);
 });
 
@@ -532,6 +688,14 @@ fbq('track', 'PageView');
 async function start() {
   await ensureAdmin();
   await ensureSample();
-  app.listen(PORT, () => console.log(`Verik Universal QR API listening on port ${PORT}`));
+
+  if (process.env.AUTOMATIC_FLUSH === "true") {
+    setInterval(flushScanBuffer, FLUSH_MS);
+    console.log(`⏱️  Background Automatic Flush Enabled (${FLUSH_MS}ms)`);
+  } else {
+    console.log(`⏱️  Background Lazy Flush Enabled (Event-driven)`);
+  }
+
+  app.listen(PORT, () => console.log(`✅ Verik QR API on :${PORT} | Prisma ORM | Scan buffer enabled`));
 }
 start().catch(e => { console.error(e); process.exit(1) });
