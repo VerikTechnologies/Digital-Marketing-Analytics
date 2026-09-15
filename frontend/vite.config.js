@@ -11,8 +11,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": { target: "http://localhost:4000", changeOrigin: true },
-      "/qr":  { target: "http://localhost:4000", changeOrigin: true },
+      "/api": { target: "https://digital-marketing-analytics.onrender.com", changeOrigin: true },
+      "/qr":  { target: "https://digital-marketing-analytics.onrender.com", changeOrigin: true },
     },
   },
   build: {
