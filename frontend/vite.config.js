@@ -11,10 +11,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": { target: "https://digital-marketing-analytics.up.railway.app", changeOrigin: true },
-      "/qr": { target: "https://digital-marketing-analytics.up.railway.app", changeOrigin: true },
+      "/api": { target: "https://digital-marketing-analytics-production.up.railway.app", changeOrigin: true },
+      "/qr": { target: "https://digital-marketing-analytics-production.up.railway.app", changeOrigin: true },
     },
-  },  
+  },    
   build: {
     rollupOptions: {
       output: {
