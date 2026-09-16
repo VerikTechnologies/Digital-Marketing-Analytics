@@ -736,8 +736,21 @@ app.get("/qr/:code", async (req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {
-  await ensureAdmin();
-  await ensureSample();
+  // ⚡ Bind to 0.0.0.0 first so Railway health check can reach us immediately
+  await new Promise((resolve) => {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`✅ Verik QR API on :${PORT} | Prisma ORM | Scan buffer enabled`);
+      resolve();
+    });
+  });
+
+  // Bootstrap runs AFTER server is up — health check won't time out
+  try {
+    await ensureAdmin();
+    await ensureSample();
+  } catch (e) {
+    console.error("[bootstrap] Warning (non-fatal):", e.message);
+  }
 
   if (process.env.AUTOMATIC_FLUSH === "true") {
     setInterval(flushScanBuffer, FLUSH_MS);
@@ -745,7 +758,5 @@ async function start() {
   } else {
     console.log(`⏱️  Background Lazy Flush Enabled (Event-driven)`);
   }
-
-  app.listen(PORT, () => console.log(`✅ Verik QR API on :${PORT} | Prisma ORM | Scan buffer enabled`));
 }
 start().catch(e => { console.error(e); process.exit(1) });
