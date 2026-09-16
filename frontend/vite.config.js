@@ -11,8 +11,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": { target: "https://digital-marketing-analytics.onrender.com", changeOrigin: true },
-      "/qr": { target: "https://digital-marketing-analytics.onrender.com", changeOrigin: true },
+      "/api": { target: "digital-marketing-analytics.railway.internal", changeOrigin: true },
+      "/qr": { target: "digital-marketing-analytics.railway.internal", changeOrigin: true },
     },
   },  
   build: {

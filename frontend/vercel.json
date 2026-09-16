@@ -2,11 +2,11 @@
   "rewrites": [
     {
       "source": "/api/:match*",
-      "destination": "https://digital-marketing-analytics.onrender.com/api/:match*"
+      "destination": "digital-marketing-analytics.railway.internal/api/:match*"
     },
     {
       "source": "/qr/:match*",
-      "destination": "https://digital-marketing-analytics.onrender.com/qr/:match*"
+      "destination": "digital-marketing-analytics.railway.internal/qr/:match*"
     },
     {
       "source": "/(.*)",
