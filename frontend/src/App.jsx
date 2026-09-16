@@ -7,7 +7,7 @@ import Brands, { preloadBrands } from "./pages/Brands";
 import Campaigns, { preloadCampaigns } from "./pages/Campaigns";
 import QRCodes, { preloadQRCodes } from "./pages/QRCodes";
 import Analytics, { preloadAnalytics } from "./pages/Analytics";
-import { Analytics } from "@vercel/analytics/react";
+import { Analytics as VercelAnalytics } from "@vercel/analytics/react";
 import api from "./api";
 
 export default function App() {
@@ -78,7 +78,7 @@ export default function App() {
           {PAGE_MAP[page] || <Dashboard />}
         </main>
       </div>
-      <Analytics />
+      <VercelAnalytics />
     </div>
   );
 }

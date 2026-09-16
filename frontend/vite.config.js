@@ -11,8 +11,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": { target: "digital-marketing-analytics.railway.internal", changeOrigin: true },
-      "/qr": { target: "digital-marketing-analytics.railway.internal", changeOrigin: true },
+      "/api": { target: "https://digital-marketing-analytics.up.railway.app", changeOrigin: true },
+      "/qr": { target: "https://digital-marketing-analytics.up.railway.app", changeOrigin: true },
     },
   },  
   build: {
