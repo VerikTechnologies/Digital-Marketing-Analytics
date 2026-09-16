@@ -186,12 +186,20 @@ async function ensureSample() {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.get("/health", async (_req, res) => {
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "verik-universal-qr" });
+});
+
+// Deep health check (DB + Redis) — not used by Railway health probe
+app.get("/health/db", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    res.json({ ok: true, service: "verik-universal-qr" });
-  } catch { res.status(503).json({ ok: false }) }
+    res.json({ ok: true, db: "connected" });
+  } catch (e) {
+    res.status(503).json({ ok: false, error: e.message });
+  }
 });
+
 
 // Auth ─────────────────────────────────────────────────────────────────────────
 app.post("/api/auth/login", async (req, res) => {
