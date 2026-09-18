@@ -9,8 +9,13 @@
       "destination": "https://digital-marketing-analytics-production.up.railway.app/qr/:match*"
     },
     {
+      "source": "/:code",
+      "destination": "https://digital-marketing-analytics-production.up.railway.app/qr/:code"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
   ]
 }
+
